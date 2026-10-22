@@ -1,11 +1,15 @@
-"""Submission interface. Implement your own selection method here."""
+"""Submission entry-point for MP2 candidate selection."""
 
 
 def predict(bank, arrays, checkpoint):
     """Return one Python integer in 0..3 per question, in bank order.
 
-    bank: list of question dictionaries with four candidate texts each.
-    arrays['embeddings']: float32 NumPy array of shape [N, 4, 1024].
-    checkpoint: pathlib.Path or None, supplied through --checkpoint.
+    Delegates to :func:`predict_method.run` which handles feature extraction,
+    model loading, scoring, and tie-breaking.
     """
-    raise NotImplementedError('Implement predict() in submission.py or supply your own --method file.')
+    return _run_prediction(bank, arrays, checkpoint)
+
+
+def _run_prediction(bank, arrays, checkpoint):
+    from predict_method import run
+    return run(bank, arrays, checkpoint)

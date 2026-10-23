@@ -1,166 +1,154 @@
-"""Train linear softmax-CE scorer, evaluate on validation, save bundle.
+"""Train the frozen candidate scorer and write the inference bundle.
 
-Usage (all relative to code/):
-    python train.py --output runs/model_bundle
+Protocol
+--------
+* Features: answer agreement (A), embedding geometry (B), answer-cluster
+  coherence (S), text surface (C), within-group relative text (R), and
+  question interaction (Q), plus a PCA of the group-centred, L2-normalised
+  candidate embeddings (P).
+* Fit on the **hard subset of train** (groups with >= 2 distinct parsed
+  answers).  The whole test bank is hard by construction, so training on the
+  easy groups only dilutes the objective.
+* Model selection uses 5-fold grouped OOF accuracy on train-hard, confirmed
+  on val-hard (bootstrap CI).  Test references are never read here.
 
-Options:
-    --split        : training split   [train]
-    --folds        : number of internal folds [5]
-    --epochs       : adam steps per fold [2000]
-    --lr           : initial learning rate [0.05]
-    --l2           : L2 regularisation strength [1e-3]
-    --features     : feature-group subset [abc]
-    --seed         : random seed [0]
-    --val-split    : validation split for model selection [validation]
-    --train-subset : 'full' or 'hard' for internal training [full]
-
-After training, also evaluates on validation and saves the bundle.
+Usage (from code/):
+    python train.py --output runs/model_bundle --kind linear --pca 256 --seed 0
 """
 
 import argparse
 import json
+import platform
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 
-from mp2lib.baselines import (
-    load_split, hard_mask, accuracy,
-)
-from mp2lib.features import build_features
+from mp2lib.baselines import load_split, hard_mask, accuracy
+from mp2lib.features import build_features, feature_names
 from mp2lib.model import (
-    fit_softmax_ce, predict_choices, save_bundle, scores_from_weights,
+    fit_linear, fit_linear_ensemble, fit_mlp, scores_from_model, save_bundle,
 )
+from mp2lib.pca import fit_pca
 
 
-def _make_feature_filter(features_set):
-    """Return indices for requested feature group(s)."""
-    from mp2lib.features import _FEATURES_A, _FEATURES_B, _FEATURES_C
-    names = features_set.lower()
-    idxs = []
-    if 'a' in names:
-        idxs += range(len(_FEATURES_A))
-    if 'b' in names:
-        idxs += range(len(_FEATURES_A), len(_FEATURES_A) + len(_FEATURES_B))
-    if 'c' in names:
-        start = len(_FEATURES_A) + len(_FEATURES_B)
-        idxs += range(start, start + len(_FEATURES_C))
-    return sorted(set(idxs))
+def bootstrap_ci(picks, labels, n_boot=2000, seed=0):
+    picks = np.asarray(picks, dtype=np.int64)
+    labels = np.asarray(labels, dtype=bool)
+    correct = labels[np.arange(len(labels)), picks]
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(correct), size=(n_boot, len(correct)))
+    accs = correct[idx].mean(axis=1)
+    lo, hi = np.percentile(accs, [2.5, 97.5])
+    return float(correct.mean()), float(lo), float(hi)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--split', default='train', choices=('train', 'validation'))
-    parser.add_argument('--val-split', default='validation', choices=('train', 'validation'))
-    parser.add_argument('--folds', type=int, default=5)
-    parser.add_argument('--epochs', type=int, default=2000)
-    parser.add_argument('--lr', type=float, default=0.05)
-    parser.add_argument('--l2', type=float, default=1e-3)
-    parser.add_argument('--features', default='abc')
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--train-subset', default='full', choices=('full', 'hard'))
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--kind', default='linear',
+                    choices=('linear', 'ensemble', 'mlp'))
+    ap.add_argument('--pca', type=int, default=256)
+    ap.add_argument('--groups', default='ABSCRQ')
+    ap.add_argument('--folds', type=int, default=5)
+    ap.add_argument('--epochs', type=int, default=3000)
+    ap.add_argument('--lr', type=float, default=0.05)
+    ap.add_argument('--l2', type=float, default=1e-3)
+    ap.add_argument('--hidden', type=int, default=96)
+    ap.add_argument('--dropout', type=float, default=0.0)
+    ap.add_argument('--n-models', type=int, default=3)
+    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--train-subset', default='hard',
+                    choices=('hard', 'full'))
+    args = ap.parse_args()
 
-    # --- Load training data ---
-    print(f"Loading train: {args.split} ({args.train_subset} subset)")
-    bank, arrays, labels = load_split(args.split)
-    feature_set_indices = _make_feature_filter(args.features)
-    F = len(feature_set_indices)
-    # Feature names for logging/reporting
-    from mp2lib.features import _FEATURES_A, _FEATURES_B, _FEATURES_C
-    fnames_all = list(_FEATURES_A) + list(_FEATURES_B) + list(_FEATURES_C)
-    feat_names_selected = [fnames_all[i] for i in feature_set_indices]
+    t_start = time.perf_counter()
+    groups = tuple(args.groups.upper())
 
-    hard = hard_mask(bank)
-    print(f"Training n={len(bank)}, features={F} (subset {'+'.join(args.features.upper())})")
-    print(f"  hard={int(hard.sum())}, easy={int((~hard).sum())}")
-    print(f"  correct slots: {labels.sum()} (out of {len(bank)*4})")
-
-    # --- Optional hard-only training subset ---
+    tr_bank, tr_arrays, tr_labels = load_split('train')
     if args.train_subset == 'hard':
-        hard_indices = np.flatnonzero(hard)
-        bank = [bank[i] for i in hard_indices]
-        arrays = {'embeddings': arrays['embeddings'][hard_indices]}
-        labels = labels[hard_indices]
-        hard = np.ones(len(bank), dtype=bool)
-        print(f"After hard subset: n={len(bank)}")
+        keep = np.flatnonzero(hard_mask(tr_bank))
+        tr_bank = [tr_bank[i] for i in keep]
+        tr_arrays = {'embeddings': tr_arrays['embeddings'][keep]}
+        tr_labels = tr_labels[keep]
+    tr_emb = tr_arrays['embeddings']
+    n = len(tr_bank)
+    print(f'train: {args.train_subset} n={n}  groups={args.groups}  pca={args.pca}')
 
-    N = len(bank)
-    feats = build_features(bank, arrays)[:, :, feature_set_indices]
+    va_bank, va_arrays, va_labels = load_split('validation')
+    va_hard = hard_mask(va_bank)
 
-    # --- Internal CV on training data ---
+    # --- 5-fold OOF on the training subset ---
     rng = np.random.default_rng(args.seed)
-    perm = rng.permutation(N)
-    fold_ids = np.array_split(perm, args.folds)
-    oof_preds = np.zeros((N, 4), dtype=np.float64)
+    fold_ids = np.array_split(rng.permutation(n), args.folds)
+    oof = np.zeros((n, 4))
+    for k, ev in enumerate(fold_ids):
+        fit_idx = np.setdiff1d(np.arange(n), ev)
+        pca = fit_pca(tr_emb[fit_idx], args.pca) if args.pca else None
+        Xf = build_features([tr_bank[i] for i in fit_idx],
+                            {'embeddings': tr_emb[fit_idx]}, groups, pca)
+        Xe = build_features([tr_bank[i] for i in ev],
+                            {'embeddings': tr_emb[ev]}, groups, pca)
+        model = _fit(args, Xf, tr_labels[fit_idx], seed=args.seed + 100 * k)
+        oof[ev] = scores_from_model(Xe, model)
+    oof_acc = accuracy(oof.argmax(axis=1), tr_labels)
+    print(f'  OOF (hard) accuracy: {100*oof_acc:.2f}%')
 
-    print("\n--- Internal 5-fold CV ---")
-    for fi, fold_eval in enumerate(fold_ids):
-        fold_train = np.setdiff1d(np.arange(N), fold_eval)
-        result = fit_softmax_ce(feats[fold_train], labels[fold_train],
-                                l2=args.l2, lr=args.lr,
-                                epochs=args.epochs, seed=args.seed + fi)
-        s = scores_from_weights(feats[fold_eval], result)
-        picks = s.argmax(axis=1)
-        acc_full = accuracy(picks, labels[fold_eval])
-        hard_eval = hard[fold_eval]
-        acc_hard = accuracy(picks[hard_eval], labels[fold_eval][hard_eval]) if hard_eval.any() else float('nan')
-        print(f"  Fold {fi+1}: full={100*acc_full:6.2f}%  hard={100*acc_hard:6.2f}%")
-        oof_preds[fold_eval] = s
+    # --- final fit on all training data ---
+    pca = fit_pca(tr_emb, args.pca) if args.pca else None
+    Xtr = build_features(tr_bank, tr_arrays, groups, pca)
+    model = _fit(args, Xtr, tr_labels, seed=args.seed)
 
-    oof_picks = oof_preds.argmax(axis=1)
-    oof_full = accuracy(oof_picks, labels)
-    oof_hard = accuracy(oof_picks[hard], labels[hard]) if hard.any() else float('nan')
-    print(f"\n  OOF: full={100*oof_full:6.2f}%  hard={100*oof_hard:6.2f}%")
+    # --- validation report ---
+    Xva = build_features(va_bank, va_arrays, groups, pca)
+    va_picks = scores_from_model(Xva, model).argmax(axis=1)
+    va_acc = accuracy(va_picks, va_labels)
+    va_hard_acc, lo, hi = bootstrap_ci(va_picks[va_hard], va_labels[va_hard])
+    print(f'  validation full: {100*va_acc:.2f}%')
+    print(f'  validation hard: {100*va_hard_acc:.2f}%  [{100*lo:.2f},{100*hi:.2f}]')
 
-
-    # --- Validation evaluation (development / selection) ---
-    val_bank, val_arrays, val_labels = load_split(args.val_split)
-    val_hard = hard_mask(val_bank)
-    val_feats = build_features(val_bank, val_arrays)[:, :, feature_set_indices]
-
-    print("\n--- Refitting on all training data ---")
-    final_result = fit_softmax_ce(feats, labels, l2=args.l2, lr=args.lr,
-                                  epochs=args.epochs * 2, seed=args.seed)
-    val_scores = scores_from_weights(val_feats, final_result)
-    val_picks = val_scores.argmax(axis=1)
-    val_acc = accuracy(val_picks, val_labels)
-    val_hard_acc = accuracy(val_picks[val_hard], val_labels[val_hard]) if val_hard.any() else float('nan')
-
-    print(f"  Validation: full={100*val_acc:.2f}%  hard={100*val_hard_acc:.2f}%")
-
-    # Save bundle
+    names = feature_names(groups, args.pca)
     config = {
-        'split': args.split,
-        'val_split': args.val_split,
+        'protocol': 'dase7506-mp2-open-hard-verifier-v5',
+        'model_kind': args.kind,
+        'groups': args.groups,
+        'n_pca': args.pca,
+        'n_features': int(Xtr.shape[-1]),
+        'feature_names': names,
+        'train_subset': args.train_subset,
+        'train_n': n,
         'folds': args.folds,
         'epochs': args.epochs,
-        'l2': args.l2,
         'lr': args.lr,
-        'features': args.features,
-        'feature_count': F,
-        'feature_names': feat_names_selected,
+        'l2': args.l2,
+        'hidden': args.hidden if args.kind == 'mlp' else None,
+        'dropout': args.dropout if args.kind == 'mlp' else None,
+        'n_models': args.n_models if args.kind == 'ensemble' else 1,
         'seed': args.seed,
-        'train_subset': args.train_subset,
-        'oof_accuracy': float(oof_full),
-        'oof_hard_accuracy': float(oof_hard),
-        'val_accuracy': float(val_acc),
-        'val_hard_accuracy': float(val_hard_acc),
+        'oof_hard_accuracy': float(oof_acc),
+        'val_accuracy': float(va_acc),
+        'val_hard_accuracy': float(va_hard_acc),
+        'val_hard_ci': [lo, hi],
+        'train_seconds': time.perf_counter() - t_start,
+        'python': platform.python_version(),
+        'numpy': np.__version__,
     }
-    save_bundle(args.output, final_result, config)
-    asset_size = (args.output / 'model.npz').stat().st_size
-    print(f"\nSaved bundle to {args.output} ({asset_size:,} bytes, limit=16 MiB)")
-    print(f"Feature count: {F}")
+    save_bundle(args.output, model, config, pca)
+    size = sum(f.stat().st_size for f in args.output.iterdir() if f.is_file())
+    print(f'  bundle {args.output} ({size:,} bytes, limit {16*2**20:,})')
 
-    if args.split != args.val_split:
-        # Print feature importance (top 10 by abs weight)
-        ws = np.abs(final_result['weights'])
-        top_k = min(10, F)
-        top_idx = np.argsort(ws)[-top_k:]
-        print(f"\nTop-{top_k} feature importances (abs(weights))")
-        for i in sorted(top_idx):
-            print(f"  {feat_names_selected[i]:<22s} {final_result['weights'][i]:+.6f}")
+
+def _fit(args, X, y, seed):
+    if args.kind == 'ensemble':
+        return fit_linear_ensemble(X, y, n_models=args.n_models, seed=seed,
+                                   l2=args.l2, lr=args.lr, epochs=args.epochs)
+    if args.kind == 'linear':
+        return fit_linear(X, y, l2=args.l2, lr=args.lr, epochs=args.epochs,
+                          seed=seed)
+    return fit_mlp(X, y, hidden=args.hidden, l2=args.l2, lr=1e-3,
+                   epochs=args.epochs, dropout=args.dropout, seed=seed)
 
 
 if __name__ == '__main__':

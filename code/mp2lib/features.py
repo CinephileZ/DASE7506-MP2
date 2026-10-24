@@ -25,10 +25,12 @@ Group P (PCA of the group-centred, L2-normalised embedding) is appended by
 """
 
 import re
+from fractions import Fraction
 
 import numpy as np
 
 from common import parse_answer
+from mp2lib.verify import audit
 
 # --- regex constants --------------------------------------------------------
 
@@ -62,6 +64,8 @@ _FEATURES_A = [
     'is_singleton',       # unique supporter while other answers exist
     'rank_by_vote',       # 0 = largest share (smallest index on ties)
     'tie_break_shortest', # among tied top answers, shortest text
+    'value_position',     # where this answer sits in the group's sorted values
+    'value_ratio_to_peak',# answer / largest absolute answer in the group
 ]
 
 _FEATURES_B = [
@@ -89,18 +93,24 @@ _FEATURES_C = [
     'num_count',
     'op_count',
     'latex_count',
-    'has_boxed',
+    'boxed_marker',
     'has_hashhash',
-    'format_priority',    # 2 = boxed, 1 = ####, 0 = neither
+    'format_priority',     # 2 = boxed, 1 = ####, 0 = neither
     'bold_count',
     'step_keyword_count',
-    'numeric_density',    # num_count / word_count
-    'avg_sentence_len',   # word_count / sentence_count
-    'ops_per_sentence',   # op_count / sentence_count
+    'numeric_density',     # num_count / word_count
+    'avg_sentence_len',    # word_count / sentence_count
+    'ops_per_sentence',    # op_count / sentence_count
     'hesitation_hits',
     'conclusion_hits',
-    'distinct_num_count', # distinct numeric values in the text
-    'eq_count',           # number of '=' signs
+    'distinct_num_count',  # distinct numeric values in the text
+    'eq_count',            # number of '=' signs
+    'list_line_count',     # lines opening with a list marker
+    'display_math_present',
+    'tail_line_len',       # characters on the final line
+    'line_break_rate',     # newlines / words
+    'answer_integral',     # the final answer is a whole number
+    'answer_below_zero',
 ]
 
 _FEATURES_R = [
@@ -115,11 +125,43 @@ _FEATURES_Q = [
     'answer_after_last_op',  # the answer is the result of the final operation
 ]
 
-_BASE_GROUPS = ('A', 'B', 'S', 'C', 'R', 'Q')
+_FEATURES_V = [
+    'calc_stated',         # equations the reader could check
+    'calc_holds',          # of those, ones that recompute exactly
+    'calc_fails',          # of those, ones that do not
+    'calc_holds_frac',
+    'calc_has_failure',    # at least one stated step does not hold
+    'calc_failure_frac',
+    'answer_stated_hits',  # stated results equal to the candidate's answer
+    'answer_stated_any',   # some stated result is the answer
+    'answer_stated_last',  # the final stated result is the answer
+    'calc_stated_rel',     # equations relative to the group mean
+]
+
+# Grounding: does the solution actually consume the question's given numbers,
+# and is the final answer just a number restated from the question (a classic
+# shortcut) or within its plausible range?
+_FEATURES_G = [
+    'ground_used_ratio',       # share of the question's numbers used by the trace
+    'ground_missing_count',    # question numbers the trace never mentions
+    'ground_answer_restated',  # the final answer is one of the given numbers
+    'ground_answer_in_range',  # the answer stays within the question's numbers
+    'ground_mentions',         # total occurrences of question numbers
+    'ground_used_relative',    # used ratio relative to the group
+]
+
+# Within-group standardised twins of every numeric statistic above: when one
+# candidate must be chosen, "the longest of the four" is a different question
+# from "long", and the twin makes that comparison available to the scorer.
+_Z_SOURCE = _FEATURES_C + _FEATURES_Q + _FEATURES_V + _FEATURES_G
+_FEATURES_Z = [f'z_{name}' for name in _Z_SOURCE]
+
+_BASE_GROUPS = ('A', 'B', 'S', 'C', 'R', 'Q', 'V', 'G', 'Z')
 
 _GROUP_NAMES = {
     'A': _FEATURES_A, 'B': _FEATURES_B, 'S': _FEATURES_S,
     'C': _FEATURES_C, 'R': _FEATURES_R, 'Q': _FEATURES_Q,
+    'V': _FEATURES_V, 'G': _FEATURES_G, 'Z': _FEATURES_Z,
 }
 
 
@@ -155,7 +197,7 @@ def _nums_with_values(text):
     return toks, vals
 
 
-def _candidate_scalars(text):
+def _candidate_scalars(text, parsed=None):
     stripped = text.strip()
     words = stripped.split()
     sentences = max(1, len(_SENTENCE_RE.findall(stripped)))
@@ -167,6 +209,15 @@ def _candidate_scalars(text):
     has_boxed = float('\\boxed{' in text)
     has_hashhash = float('####' in text)
     distinct = len({round(v, 6) for v in vals if np.isfinite(v)})
+    lines = [ln for ln in stripped.splitlines() if ln.strip()]
+    ans_int = ans_neg = 0.0
+    if parsed is not None:
+        try:
+            fv = float(Fraction(parsed))
+            ans_int = float(fv.is_integer())
+            ans_neg = float(fv < 0)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            pass
 
     return {
         'length': float(len(text)),
@@ -175,7 +226,7 @@ def _candidate_scalars(text):
         'num_count': float(len(toks)),
         'op_count': float(len(ops)),
         'latex_count': float(len(latex)),
-        'has_boxed': has_boxed,
+        'boxed_marker': has_boxed,
         'has_hashhash': has_hashhash,
         'format_priority': 2.0 * has_boxed + 1.0 * has_hashhash,
         'bold_count': float(len(_BOLD_RE.findall(stripped))),
@@ -187,6 +238,12 @@ def _candidate_scalars(text):
         'conclusion_hits': float(sum(1 for w in _CONCLUSION_WORDS if w in lower)),
         'distinct_num_count': float(distinct),
         'eq_count': float(stripped.count('=')),
+        'list_line_count': float(sum(1 for ln in lines if ln.lstrip()[:1] in ('-', '*'))),
+        'display_math_present': float('$$' in text),
+        'tail_line_len': float(len(lines[-1]) if lines else 0),
+        'line_break_rate': float(stripped.count('\n') / max(len(words), 1)),
+        'answer_integral': ans_int,
+        'answer_below_zero': ans_neg,
         '_vals': vals,
     }
 
@@ -215,9 +272,10 @@ def _build_group(bank, arrays):
     """Return [N, 4, F_base] for groups A, B, S, C, R, Q."""
     n = len(bank)
     emb = np.asarray(arrays['embeddings'], dtype=np.float64)
-    fA, fB, fS, fC, fR, fQ = [], [], [], [], [], []
+    fA, fB, fS, fC, fR, fQ, fV, fG = [], [], [], [], [], [], [], []
 
-    nA, nB, nS, nC, nR, nQ = (len(_GROUP_NAMES[g]) for g in ('A', 'B', 'S', 'C', 'R', 'Q'))
+    nA, nB, nS, nC, nR, nQ, nV, nG = (len(_GROUP_NAMES[g]) for g in
+                                      ('A', 'B', 'S', 'C', 'R', 'Q', 'V', 'G'))
 
     A = np.zeros((n, 4, nA))
     B = np.zeros((n, 4, nB))
@@ -225,12 +283,14 @@ def _build_group(bank, arrays):
     C = np.zeros((n, 4, nC))
     R = np.zeros((n, 4, nR))
     Q = np.zeros((n, 4, nQ))
+    V = np.zeros((n, 4, nV))
+    G = np.zeros((n, 4, nG))
 
     for g in range(n):
         row = bank[g]
         texts = [c['text'] for c in row['candidates']]
         parsed = [parse_answer(t) for t in texts]
-        sc = [_candidate_scalars(t) for t in texts]
+        sc = [_candidate_scalars(t, p) for t, p in zip(texts, parsed)]
         lengths = [s['length'] for s in sc]
 
         # --- A: vote structure
@@ -250,10 +310,26 @@ def _build_group(bank, arrays):
 
         votes = [counts.get(p, 0) if p is not None else 0 for p in parsed]
         ranks = _group_relative_ranks(votes)
+        # answer-value ordering: some error modes land on a "total" or an
+        # endpoint value, which this exposes without any text-level evidence
+        fvals = []
+        for p in parsed:
+            try:
+                fvals.append(float(Fraction(p)) if p is not None else None)
+            except (ValueError, ZeroDivisionError):
+                fvals.append(None)
+        finite_vals = sorted({v for v in fvals if v is not None})
+        max_abs = max((abs(v) for v in finite_vals), default=0.0)
         for c in range(4):
             p = parsed[c]
             vc = votes[c]
             other = max([cnt for a, cnt in counts.items() if a != p], default=0)
+            fv = fvals[c]
+            if fv is None or len(finite_vals) < 2:
+                vrank, rel_max = 0.0, 0.0
+            else:
+                vrank = finite_vals.index(fv) / (len(finite_vals) - 1)
+                rel_max = fv / max(max_abs, 1e-9)
             A[g, c] = [
                 float(p is not None),
                 float(vc),
@@ -265,6 +341,8 @@ def _build_group(bank, arrays):
                 float(vc == 1 and len(counts) >= 2),
                 float(ranks[c]),
                 float(c in tie_short and p is not None and vc == max_vote),
+                float(vrank),
+                float(rel_max),
             ]
 
         # --- B: embedding geometry
@@ -334,7 +412,6 @@ def _build_group(bank, arrays):
                 Q[g, c] = [0.0, 0.0, 0.0, 0.0]
                 continue
             try:
-                from fractions import Fraction
                 pv = float(Fraction(p))
                 in_q = float(round(pv, 6) in q_set)
             except (ValueError, ZeroDivisionError):
@@ -346,7 +423,73 @@ def _build_group(bank, arrays):
             last_is = float(bool(finite) and np.isfinite(pv) and abs(finite[-1] - pv) < 1e-6)
             Q[g, c] = [in_q, mentions, last_is, float(len(q_tokens))]
 
-    return np.concatenate([A, B, S, C, R, Q], axis=-1)
+        # --- V: exact-arithmetic verification of the stated steps
+        audits = [audit(t, p) for t, p in zip(texts, parsed)]
+        steps_arr = np.array([a.n_steps for a in audits], dtype=np.float64)
+        steps_mu = steps_arr.mean()
+        steps_sd = max(steps_arr.std(), 1e-6)
+        for c in range(4):
+            a = audits[c]
+            V[g, c] = [
+                float(a.n_steps),
+                float(a.n_ok),
+                float(a.n_bad),
+                (a.n_ok / a.n_steps) if a.n_steps else 0.0,
+                float(a.n_bad > 0),
+                (a.n_bad / a.n_steps) if a.n_steps else 0.0,
+                float(a.reach_hits),
+                float(a.reach_any),
+                float(a.reach_last),
+                (steps_arr[c] - steps_mu) / steps_sd,
+            ]
+
+        # --- G: grounding in the question's given numbers
+        # Each number in the question is looked for in the trace one by one,
+        # so a number that appears only as part of a larger value (12 inside
+        # 120) does not count as consumed.
+        q_str = str(row.get('question', ''))
+        q_values = [v for v in _nums_with_values(q_str)[1] if np.isfinite(v)]
+        q_unique = []
+        for v in q_values:
+            if not any(abs(v - u) < 1e-6 for u in q_unique):
+                q_unique.append(v)
+        consumed = []
+        for c in range(4):
+            body = [v for v in sc[c]['_vals'] if np.isfinite(v)]
+            hits = 0
+            for qv in q_unique:
+                if any(abs(v - qv) < 1e-6 for v in body):
+                    hits += 1
+            consumed.append(hits)
+        consumed_arr = np.array(consumed, dtype=np.float64)
+        consumed_mu = consumed_arr.mean()
+        consumed_sd = max(consumed_arr.std(), 1e-6)
+        q_peak = max((abs(v) for v in q_unique), default=None)
+        for c in range(4):
+            p = parsed[c]
+            try:
+                pv = float(Fraction(p)) if p is not None else None
+            except (ValueError, ZeroDivisionError):
+                pv = None
+            nq = len(q_unique)
+            share = consumed[c] / nq if nq else 0.0
+            idle = nq - consumed[c]
+            restated = float(pv is not None
+                             and any(abs(pv - qv) < 1e-6 for qv in q_unique))
+            in_range = float(pv is not None and q_peak is not None
+                             and abs(pv) <= q_peak + 1e-9)
+            repeats = float(sum(1 for v in sc[c]['_vals'] if np.isfinite(v)
+                                and any(abs(v - qv) < 1e-6 for qv in q_unique)))
+            G[g, c] = [share, float(idle), restated, in_range, repeats,
+                       (consumed_arr[c] - consumed_mu) / consumed_sd]
+
+    # --- Z: within-group standardised twins of the C/Q/V/G statistics
+    src = np.concatenate([C, Q, V, G], axis=-1)          # [N, 4, len(_Z_SOURCE)]
+    mu = src.mean(axis=1, keepdims=True)
+    sd = np.maximum(src.std(axis=1, keepdims=True), 1e-6)
+    Z = (src - mu) / sd
+
+    return np.concatenate([A, B, S, C, R, Q, V, G, Z], axis=-1)
 
 
 def build_base_features(bank, arrays):

@@ -33,9 +33,15 @@ def standardize_stats(features):
     return mean, std
 
 
+# Standardised features are capped so a single outlier cannot dominate the
+# dense embedding blocks; the cap sits far out in the tail of the training
+# distribution, where it acts as a safety net rather than a data transform.
+_CAP = 12.0
+
+
 def _apply_standardize(features, mean, std):
     flat = features.reshape(-1, features.shape[-1]).astype(np.float64)
-    return (flat - mean) / std
+    return np.clip((flat - mean) / std, -_CAP, _CAP)
 
 
 def _targets(labels):
@@ -55,12 +61,19 @@ def _softmax(z):
 # ---------------------------------------------------------------------------
 
 def fit_linear(features, labels, l2=1e-3, lr=0.05, epochs=3000, seed=0,
-               verbose=False):
-    """Fit a single weight vector by group-softmax CE with Adam."""
+               verbose=False, l2_vector=None):
+    """Fit a single weight vector by group-softmax CE with Adam.
+
+    ``l2_vector`` overrides ``l2`` with a per-feature penalty vector, which
+    lets dense embedding blocks be shrunk much harder than the sparse
+    hand-crafted statistics without changing the data.
+    """
     n, c, f = features.shape
     mean, std = standardize_stats(features)
     xg = _apply_standardize(features, mean, std).reshape(n, c, f)
     tgt = _targets(labels)
+    reg = np.broadcast_to(np.asarray(l2 if l2_vector is None else l2_vector,
+                                    dtype=np.float64), (f,))
 
     rng = np.random.default_rng(seed)
     w = rng.normal(0.0, 0.01, size=f)
@@ -73,7 +86,7 @@ def fit_linear(features, labels, l2=1e-3, lr=0.05, epochs=3000, seed=0,
     for step in range(1, epochs + 1):
         prob = _softmax(xg @ w + b)
         gz = (prob - tgt) / n                                  # [N, C]
-        gw = gz.reshape(-1) @ xf + l2 * w
+        gw = gz.reshape(-1) @ xf + reg * w
         gb = gz.sum()
         mw = beta1 * mw + (1 - beta1) * gw
         vw = beta2 * vw + (1 - beta2) * gw * gw
@@ -148,6 +161,47 @@ def fit_mlp(features, labels, hidden=64, l2=1e-3, lr=3e-3, epochs=1500,
 
     return {'kind': 'mlp', 'w1': w1, 'b1': b1, 'w2': w2.reshape(-1), 'b2': float(b2[0]),
             'hidden': hidden, 'mean': mean, 'std': std}
+
+
+def fit_linear_lbfgs(features, labels, l2_vector=None, l2=1e-3, max_iter=600,
+                     seed=0):
+    """Fit the linear scorer with L-BFGS on the exact full-batch objective.
+
+    Adam's fixed step budget leaves the softmax-CE surface partly unexplored;
+    L-BFGS runs to its own convergence criterion, and fitting from two
+    starting points (random + zero) keeps the better loss, which makes the
+    fit deterministic and insensitive to the initialisation.
+    """
+    from scipy.optimize import minimize
+
+    n, c, f = features.shape
+    mean, std = standardize_stats(features)
+    xg = _apply_standardize(features, mean, std).reshape(n, c, f)
+    tgt = _targets(labels)
+    reg = np.broadcast_to(np.asarray(l2 if l2_vector is None else l2_vector,
+                                    dtype=np.float64), (f,))
+
+    def loss_grad(w):
+        scores = xg @ w
+        scores = scores - scores.max(axis=1, keepdims=True)
+        lse = np.log(np.exp(scores).sum(axis=1))
+        loss = (lse - (tgt * scores).sum(axis=1)).mean()
+        p = np.exp(scores - lse[:, None])
+        grad = np.einsum('nc,ncf->f', (p - tgt) / n, xg) + reg * w
+        return loss + 0.5 * float((reg * w * w).sum()), grad
+
+    rng = np.random.default_rng(seed)
+    best_w, best_loss = None, np.inf
+    # Two starting points: the origin, and a random vector scaled like the
+    # data (1/sqrt(d)).  L-BFGS can get stuck in a flat region from one of
+    # them, so the lower-loss solution is kept.
+    for w0 in (np.zeros(f), rng.normal(0.0, 1.0 / np.sqrt(f), size=f)):
+        res = minimize(loss_grad, w0, jac=True, method='L-BFGS-B',
+                       options={'maxiter': max_iter, 'maxfun': max_iter * 2})
+        if res.fun < best_loss:
+            best_loss, best_w = float(res.fun), res.x
+    return {'kind': 'linear', 'weights': best_w, 'bias': 0.0,
+            'mean': mean, 'std': std}
 
 
 def fit_linear_ensemble(features, labels, n_models=3, seed=0, **kw):

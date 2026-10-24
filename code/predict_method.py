@@ -1,7 +1,7 @@
 """Frozen MP2 candidate selector.
 
 ``predict(bank, arrays, checkpoint)`` is the interface required by the course
-runner (see ``submission.py``).  The method rebuilds the features described in
+runner (see ``submission.py``).  The method rebuilds the evidence described in
 ``mp2lib.features`` from the question, the four candidate texts and the
 supplied whole-trace embeddings, applies the frozen scorer stored in the
 checkpoint bundle, and returns the argmax candidate index per question.
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from mp2lib.features import build_features
+from mp2lib.features import build_base_features, _select_groups
 from mp2lib.model import scores_from_model
 from mp2lib.pca import PCAModel
 
@@ -46,25 +46,18 @@ def _vote_fallback(bank):
 
 
 def _load_bundle(checkpoint):
+    """Read the frozen linear scorer; returns (model, config, pca)."""
     cp = Path(checkpoint)
     model_path, config_path = cp / 'model.npz', cp / 'config.json'
     if not (model_path.exists() and config_path.exists()):
         return None, None, None
     config = json.loads(config_path.read_text())
+    if config.get('model_kind') != 'linear':
+        raise ValueError(f"unsupported bundle kind {config.get('model_kind')!r}")
     with np.load(model_path, allow_pickle=False) as f:
         raw = {k: f[k] for k in f.files}
-    kind = config['model_kind']
-    if kind == 'mlp':
-        model = {'kind': 'mlp', 'w1': raw['w1'], 'b1': raw['b1'],
-                 'w2': raw['w2'].reshape(-1), 'b2': float(raw['b2']),
-                 'mean': raw['mean'], 'std': raw['std']}
-    elif kind == 'ensemble':
-        model = {'kind': 'ensemble', 'weights': raw['weights'],
-                 'bias': np.asarray(raw['bias'], dtype=np.float64),
-                 'mean': raw['mean'], 'std': raw['std']}
-    else:
-        model = {'kind': 'linear', 'weights': raw['weights'],
-                 'bias': float(raw['bias']), 'mean': raw['mean'], 'std': raw['std']}
+    model = {'kind': 'linear', 'weights': raw['weights'],
+             'bias': float(raw['bias']), 'mean': raw['mean'], 'std': raw['std']}
     pca = PCAModel.from_arrays(raw) if 'pca_components' in raw else None
     return model, config, pca
 
@@ -75,6 +68,17 @@ def run(bank, arrays, checkpoint):
         return [int(i) for i in _vote_fallback(bank)]
 
     groups = tuple(config['groups'])
-    features = build_features(bank, arrays, groups, pca)
+    emb_blocks = tuple(config.get('emb_blocks', ''))
+    base = build_base_features(bank, arrays)
+    parts = [_select_groups(base, groups)]
+    if emb_blocks:
+        emb = np.asarray(arrays['embeddings'], dtype=np.float64)
+        if 'E' in emb_blocks:
+            parts.append(emb)
+        if 'D' in emb_blocks:
+            parts.append(emb - emb.mean(axis=1, keepdims=True))
+    if pca is not None:
+        parts.append(pca.transform(arrays['embeddings']))
+    features = np.concatenate(parts, axis=-1) if len(parts) > 1 else parts[0]
     scores = scores_from_model(features, model)
     return [int(i) for i in scores.argmax(axis=1)]
